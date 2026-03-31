@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@dgreenheck/ez-tree": "^1.1.0",
+    "cesium": "^1.139.1",
     "three": "^0.171.0",
     "three.terrain.js": "^2.0.0"
   },
