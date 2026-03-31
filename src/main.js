@@ -5,23 +5,23 @@ import { loadThreeTerrain } from './utils/loadThreeTerrain.js';
 
 async function main() {
     const container = document.getElementById('container');
-    
+
     await loadThreeTerrain();
 
     const oceanScene = new OceanScene(container);
     try {
         await oceanScene.init();
-        
+
         setupControls(oceanScene);
-        
+
         oceanScene.hideLoading();
-        
+
         oceanScene.animate();
-        
+
         console.log('写实海洋场景加载完成！');
     } catch (error) {
         console.error('场景加载失败:', error);
-        
+
         const loading = document.getElementById('loading');
         if (loading) {
             loading.innerHTML = `
