@@ -1,0 +1,18 @@
+{
+  "name": "realistic-ocean-scene",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@dgreenheck/ez-tree": "^1.1.0",
+    "three": "^0.171.0",
+    "three.terrain.js": "^2.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
