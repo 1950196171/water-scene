@@ -189,7 +189,6 @@ const rainShader = `
         vec2 texel = 1.0 / max(resolution, vec2(1.0));
         vec2 distortion = normal * (0.35 + focus * 48.0 + impact.x * 1.6);
         
-        // Use colorTexture in Cesium instead of tDiffuse
         vec3 base =
             texture(colorTexture, uv + distortion).rgb * 0.4 +
             texture(colorTexture, uv + distortion + vec2(texel.x * focus * 24.0, 0.0)).rgb * 0.15 +
@@ -276,44 +275,61 @@ const snowShader = `
 const cloudShader = `
     uniform sampler2D colorTexture;
     uniform sampler2D depthTexture;
+    uniform sampler2D cloudMask;
+    uniform sampler2D weatherTexture;
     uniform float time;
     uniform vec2 resolution;
     
+    uniform float cameraAltitude;
     uniform float cloudCoverage;
     uniform float cloudDensity;
-    uniform float cloudHeight;
+    uniform float cloudBaseHeight;
+    uniform float cloudTopHeight;
     uniform float scale;
     uniform float detailScale;
     uniform float softness;
     uniform vec2 drift;
+    uniform vec3 sunDirection;
+    uniform float atmosphereStrength;
+    uniform float absorptionStrength;
     
     in vec2 v_textureCoordinates;
     out vec4 fragColor;
     
-    float hash(vec2 p) {
-        p = fract(p * vec2(123.34, 456.21));
-        p += dot(p, p + 78.233);
-        return fract(p.x * p.y);
+    vec2 raySphereIntersect(float camAlt, float H, float rayDirY) {
+        float R = 6378137.0;
+        float A = 1.0 / (2.0 * R);
+        float B = rayDirY + (camAlt * rayDirY) / R;
+        float C = (camAlt - H) + (camAlt * camAlt - H * H) / (2.0 * R);
+        float delta = B * B - 4.0 * A * C;
+        if (delta < 0.0) return vec2(-1.0, -1.0);
+        float sqrtDelta = sqrt(delta);
+        float s = B >= 0.0 ? 1.0 : -1.0;
+        float q = -0.5 * (B + s * sqrtDelta);
+        return vec2(min(q / A, C / q), max(q / A, C / q));
     }
 
-    float noise(vec2 p) {
-        vec2 i = floor(p);
-        vec2 f = fract(p);
-        vec2 u = f * f * (3.0 - 2.0 * f);
-
-        return mix(
-            mix(hash(i + vec2(0.0, 0.0)), hash(i + vec2(1.0, 0.0)), u.x),
-            mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
-            u.y
-        );
+    float hash13(vec3 p) {
+        p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+        p += dot(p, p.yxz + 33.33);
+        return fract((p.x + p.y) * p.z);
     }
 
-    float fbm(vec2 p) {
+    float noise3(vec3 p) {
+        vec3 i = floor(p);
+        vec3 f = fract(p);
+        vec3 u = f * f * (3.0 - 2.0 * f);
+        float nxy0 = mix(mix(hash13(i), hash13(i+vec3(1,0,0)), u.x), mix(hash13(i+vec3(0,1,0)), hash13(i+vec3(1,1,0)), u.x), u.y);
+        float nxy1 = mix(mix(hash13(i+vec3(0,0,1)), hash13(i+vec3(1,0,1)), u.x), mix(hash13(i+vec3(0,1,1)), hash13(i+vec3(1,1,1)), u.x), u.y);
+        return mix(nxy0, nxy1, u.z);
+    }
+
+    float fbm3(vec3 p) {
         float value = 0.0;
         float amplitude = 0.5;
-        for (int i = 0; i < 5; i++) {
-            value += amplitude * noise(p);
-            p = p * 2.03 + vec2(11.7, 7.3);
+        for (int i = 0; i < 4; i++) {
+            value += amplitude * noise3(p);
+            p = p * 2.02 + vec3(17.2, 11.3, 7.7);
             amplitude *= 0.5;
         }
         return value;
@@ -324,72 +340,197 @@ const cloudShader = `
         vec4 baseColor = texture(colorTexture, uv);
         float depth = czm_readDepth(depthTexture, uv);
         
-        // Compute precise ray direction using far plane (depth=1.0)
-        vec4 farEC = czm_windowToEyeCoordinates(gl_FragCoord.xy, 1.0);
-        vec3 rayEC = normalize(farEC.xyz);
-        vec3 D = normalize((czm_inverseView * vec4(rayEC, 0.0)).xyz);
+        vec4 clipPos = vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 farEC = czm_inverseProjection * clipPos;
+        vec3 rayEC = normalize(farEC.xyz / max(farEC.w, 0.000001));
+        vec3 rayDir = normalize((czm_inverseView * vec4(rayEC, 0.0)).xyz);
+        vec3 up = normalize(czm_viewerPositionWC);
+        float rayDirY = dot(rayDir, up);
         
-        // Only draw clouds on sky/distant objects (depth mask)
-        float depthMask = step(0.999, depth);
-        if (depthMask < 0.5) {
-            fragColor = baseColor;
-            return;
+        vec2 shellBase = raySphereIntersect(cameraAltitude, cloudBaseHeight, rayDirY);
+        vec2 shellTop  = raySphereIntersect(cameraAltitude, cloudTopHeight,  rayDirY);
+        
+        // ─── UNIFIED BRANCHLESS INTERSECTION ────────────────────────────────────
+        // Calculate all intersection pairs.
+        // shellBase.x refers to the entry point into the atmospheric shell.
+        // We find the entry/exit points that overlap with the cloud layer (base to top).
+        float t0 = (cameraAltitude < cloudBaseHeight) ? shellBase.y : (cameraAltitude > cloudTopHeight) ? shellTop.x : 0.0;
+        float t1 = (cameraAltitude < cloudBaseHeight) ? shellTop.y  : (cameraAltitude > cloudTopHeight) ? shellBase.x : shellTop.y;
+        
+        // Final unified stability interval
+        float tMin = max(t0, 0.0);
+        float tMax = max(t1, 0.0);
+        // ──────────────────────────────────────────────────────────────────────────
+        
+        tMin = max(tMin, 0.0);
+        const float maxVisualDist = 2000000.0;
+        if (tMin > maxVisualDist || tMax < 0.0) { fragColor = baseColor; return; }
+        tMax = min(tMax, maxVisualDist);
+        
+        // Synchronized Eye-Space Depth: Reconstruct eye-Z using native functions.
+        // By comparing sceneEyeZ with rayEyeZ (both derived from the same matrix),
+        // we ensure that multi-frustum jitter cancels out perfectly.
+        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
+        float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
+        
+        float cloudShellTMax = tMax;
+        
+        // ─── TOTAL CONTINUITY WEIGHTS ───────────────────────────────────────────
+        // Instead of binary 'return' paths, we use smooth weights that modulate 
+        // the final cloud contribution. This prevents all full-layer flashes.
+        
+        // 1. Horizon Smooth Cutoff: Naturally fades clouds near/below horizon.
+        float horizonContinuity = smoothstep(-0.08, 0.02, rayDirY);
+        
+        // 2. Distance Smooth Cutoff: Naturally fades극 far clouds.
+        const float VISUAL_MAX = 1500000.0;
+        float distContinuity = smoothstep(VISUAL_MAX, VISUAL_MAX * 0.8, tMin);
+        
+        // Combined continuity multiplier
+        float totalContinuity = horizonContinuity * distContinuity;
+        if (totalContinuity <= 0.001 || tMin >= cloudShellTMax) { fragColor = baseColor; return; }
+        
+        const float FIXED_STEP = 250.0;
+        const int MAX_STEPS = 56;
+        
+        // Stable Start: No more grid snapping. 
+        // Dithering helps mask depth precision issues.
+        float t = tMin + fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453) * 5.0;
+        
+        float transmittance = 1.0;
+        vec3 scatteredLight = vec3(0.0);
+        vec3 sunDir = normalize(sunDirection);
+        float cosSun = dot(rayDir, sunDir);
+        float g1 = 0.85; float g2 = -0.25;
+        float hg1 = (1.0 - g1*g1) / pow(1.0 + g1*g1 - 2.0*g1*cosSun, 1.5);
+        float hg2 = (1.0 - g2*g2) / pow(1.0 + g2*g2 - 2.0*g2*cosSun, 1.5);
+        float phaseForward = 0.5 + mix(hg2, hg1, 0.65) * 0.079577 * 3.5;
+        float viewUp = clamp(dot(rayDir, up) * 0.5 + 0.5, 0.0, 1.0);
+        float atmSunUp = clamp(dot(sunDir, up), 0.0, 1.0);
+        float atmSunDown = clamp(-dot(sunDir, up), 0.0, 1.0);
+        vec3 sunLightColor = mix(vec3(1.0, 0.45, 0.15), vec3(0.98, 0.96, 0.94), smoothstep(0.0, 0.3, atmSunUp));
+        vec3 ambientColor = mix(vec3(0.35, 0.45, 0.65), vec3(0.56, 0.64, 0.78), atmSunUp);
+        vec3 atmosphereColor = mix(vec3(0.2, 0.3, 0.5), vec3(0.6, 0.75, 0.9), viewUp) * (0.4 + 0.6 * atmSunUp) + sunLightColor * pow(max(cosSun, 0.0), 6.0) * 0.5;
+        float absorptionCoeff = mix(0.5, 3.5, clamp(absorptionStrength, 0.0, 1.0));
+        float densBoost = mix(0.5, 4.0, clamp(cloudDensity, 0.0, 1.0));
+        float covThreshold = mix(0.7, 0.2, clamp(cloudCoverage, 0.0, 1.0));
+        float horizonFade = smoothstep(0.0, 0.05, rayDirY);
+        
+        vec3 camNormW = normalize(czm_viewerPositionWC);
+        float R_earth = 6378137.0;
+        float camR = R_earth + cameraAltitude;
+        
+        vec2 flowOffset = drift * time * 50.0;
+        for (int i = 0; i < MAX_STEPS; i++) {
+            if (t > cloudShellTMax || transmittance < 0.02) break;
+            // Soft Occlusion Factor: fixed 500m smoothing in eye-space.
+            // (t * rayEC.z) is the eye-Z of the current sampling point.
+            float occlusionWeight = (depth < 1.0) ? smoothstep(sceneEyeZ, sceneEyeZ - 500.0 * abs(rayEC.z), t * rayEC.z) : 1.0;
+            float h = cameraAltitude + t * rayDirY + (t * t) / (2.0 * R_earth);
+            
+            vec3 sampleDir = normalize(camNormW + (t / camR) * rayDir);
+            vec2 flow = vec2(atan(sampleDir.y, sampleDir.x), asin(clamp(sampleDir.z, -1.0, 1.0))) * R_earth / (scale * 0.5) + flowOffset;
+            float maskVal = texture(cloudMask, fract(flow * 0.02)).r;
+            float maskVal2 = texture(cloudMask, fract(flow * 0.011 + vec2(0.17, 0.31))).r;
+            vec3 weather = texture(weatherTexture, fract(flow * 0.005)).rgb;
+            float boundaryNoise = fbm3(vec3(flow * 0.22, h / (scale * 0.2) + 11.0));
+            float dBase = cloudBaseHeight + (boundaryNoise - 0.5) * 2.0 * (mix(120.0, 900.0, weather.r) + maskVal * 300.0) - weather.g * 120.0;
+            float dTop = cloudTopHeight + (0.5 - boundaryNoise) * 0.9 * (mix(250.0, 1700.0, weather.b) + maskVal2 * 450.0) + weather.b * 420.0;
+            float heightFrac = clamp((h - dBase) / max(dTop - dBase, 500.0), 0.0, 1.0);
+            float heightProfile = smoothstep(0.0, mix(0.2, 0.35, maskVal), heightFrac) * smoothstep(1.0, mix(0.35, 0.7, maskVal2), heightFrac);
+            if (heightProfile > 0.005) {
+                float weatherMask = mix(1.0, clamp(maskVal * 0.45 + maskVal2 * 0.35 + weather.r * 0.55, 0.0, 1.0), 0.80);
+                float weatherWeight = smoothstep(covThreshold - 0.26, covThreshold + 0.12, weatherMask);
+                if (weatherWeight > 0.001) {
+                    float n = fbm3(vec3(flow, h / (scale * 0.1)) * 0.4) * 0.7 + fbm3(vec3(flow, h / (scale * 0.1)) * detailScale) * 0.3;
+                    float shape = n * mix(0.4, 1.0, weatherWeight) - covThreshold;
+                    float shapeWeight = smoothstep(-0.04, 0.22, shape);
+                    if (shapeWeight > 0.001) {
+                        float density = shapeWeight * heightProfile * densBoost * mix(0.5, 2.5, weather.g) * 0.012 * occlusionWeight;
+                        float stepExp = exp(-density * FIXED_STEP * absorptionCoeff);
+                        float sunPen = smoothstep(0.0, 1.0, heightFrac);
+                        vec3 S = mix(sunLightColor * phaseForward * sunPen * (0.8 + 1.2 * (1.0 - exp(-density * FIXED_STEP * 4.0))) + ambientColor * (0.6 + 0.4 * mix(1.0, exp(-density * FIXED_STEP * absorptionCoeff * 0.2), 0.5)), atmosphereColor, clamp(atmosphereStrength, 0.0, 1.0) * 0.6 * (1.0 - sunPen * 0.3));
+                        scatteredLight += transmittance * (1.0 - stepExp) * S;
+                        transmittance *= stepExp;
+                    }
+                }
+            }
+            t += FIXED_STEP;
         }
+        transmittance = mix(1.0, transmittance, horizonFade);
+        // Apply Totality Continuity weight (horizon/dist/occlusion combo)
+        float finalOpacity = (1.0 - transmittance) * totalContinuity;
+        fragColor = vec4(mix(baseColor.rgb, baseColor.rgb * transmittance + scatteredLight * horizonFade, totalContinuity), 1.0);
+    }
+`;
 
-        vec3 up = normalize(czm_viewerPositionWC); 
-        float lookUpAngle = dot(D, up);
+const cloudShadowShader = `
+    uniform sampler2D colorTexture;
+    uniform sampler2D depthTexture;
+    uniform sampler2D cloudMask;
+    uniform sampler2D weatherTexture;
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float cloudCoverage;
+    uniform float cloudBaseHeight;
+    uniform float cloudTopHeight;
+    uniform float scale;
+    uniform vec2 drift;
+    uniform vec3 sunDirection;
+    uniform float shadowStrength;
+    uniform float cameraAltitude;
+    in vec2 v_textureCoordinates;
+    out vec4 fragColor;
+
+    void main() {
+        vec2 uv = v_textureCoordinates;
+        vec4 baseColor = texture(colorTexture, uv);
+        float depth = czm_readDepth(depthTexture, uv);
+        vec4 rayEC = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec3 rayDirEC = normalize(rayEC.xyz / rayEC.w);
+        vec3 rayDir = normalize(czm_inverseViewRotation * rayDirEC);
+        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
+        float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
+        float sceneT = sceneEyeZ / min(rayDirEC.z, -0.000001);
+        // Sanity clamp: anything too far isn't ground for shadows.
+        if (depth >= 0.99999 || sceneT > 40000.0) sceneT = 40000.0; 
         
-        if (lookUpAngle < 0.02) {
-            fragColor = baseColor;
-            return;
-        }
+        vec3 offset = rayDir * sceneT;
+        vec3 camUp = normalize(czm_viewerPositionWC);
+        vec3 sunDir = normalize(sunDirection);
+        float sunUp = dot(sunDir, camUp);
+        // Smooth Sun Cutoff: replace binary drop-out with a smooth fade near horizon.
+        float sunContinuity = smoothstep(0.0, 0.04, sunUp);
         
-        // Calculate intersection distance to the local horizontal cloud plane
-        float t_val = cloudHeight / lookUpAngle;
-        vec3 offset = t_val * D;
+        float h_ground = cameraAltitude + dot(offset, camUp);
+        float h_target = mix(cloudBaseHeight, cloudTopHeight, 0.45);
+        float toCloud = (h_target - h_ground) / max(sunUp, 0.02);
         
-        // Build a local tangent plane at the camera to map coordinates
-        vec3 north = vec3(0.0, 0.0, 1.0);
-        vec3 right = normalize(cross(north, up));
-        if (length(right) < 0.1) right = vec3(1.0, 0.0, 0.0);
-        vec3 forward = normalize(cross(up, right));
+        // Final shadow contribution weight
+        float totalShadowContinuity = sunContinuity * smoothstep(40000.0, 15000.0, sceneT);
+        if (totalShadowContinuity < 0.001 || toCloud <= 0.0) { fragColor = baseColor; return; }
         
-        // Project offset onto the local 2D tangent plane (right, forward)
-        vec2 cloudPlanePos = vec2(dot(offset, right), dot(offset, forward));
+        // Stabilize shadow mask by adding a generous bias to the coverage lookup
+        // and using smoothstep instead of a hard binary test.
+        float R_earth = 6378137.0;
+        float camR = R_earth + cameraAltitude;
+        vec3 camNormW = normalize(czm_viewerPositionWC);
+        vec3 totalOffset = offset + sunDir * toCloud;
+        vec3 sampleDir = normalize(camNormW + totalOffset / camR);
+        vec2 flow = vec2(atan(sampleDir.y, sampleDir.x), asin(clamp(sampleDir.z, -1.0, 1.0))) * R_earth / (scale * 0.5) + drift * time * 50.0;
+        float maskVal = texture(cloudMask, fract(flow * 0.02)).r;
+        float maskVal2 = texture(cloudMask, fract(flow * 0.011 + vec2(0.17, 0.31))).r;
+        float maskDetail = texture(cloudMask, fract(flow * 0.065 + vec2(0.09, 0.41))).r;
+        vec3 weather = texture(weatherTexture, fract(flow * 0.005)).rgb;
+        float weatherMask = mix(1.0, clamp(clamp(maskVal * 0.45 + maskVal2 * 0.35 + weather.r * 0.55, 0.0, 1.0) * 0.72 + maskDetail * 0.28, 0.0, 1.0), 0.86);
         
-        vec2 flow = cloudPlanePos / scale + drift * time * 40.0;
+        float covRef = mix(0.74, 0.24, clamp(cloudCoverage, 0.0, 1.0));
+        // Smoothly fade shadow near coverage threshold to hide depth jitter
+        float shadow = smoothstep(covRef + 0.20, covRef - 0.40, weatherMask);
+        // Apply smooth shadow continuity
+        shadow *= totalShadowContinuity;
         
-        float horizonFade = smoothstep(0.02, 0.18, lookUpAngle);
-        
-        if (horizonFade < 0.01) {
-            fragColor = baseColor;
-            return;
-        }
-        
-        float baseNoise = fbm(flow);
-        float detail = fbm(flow * detailScale + vec2(0.0, time * 0.01));
-        float billow = fbm(flow * 0.62);
-        
-        float shape = baseNoise * 0.6 + billow * 0.3 + detail * 0.1;
-        
-        float densityBoost = mix(0.78, 1.28, clamp(cloudDensity, 0.0, 1.0));
-        float coverageThreshold = mix(0.84, 0.34, clamp(cloudCoverage, 0.0, 1.0));
-        
-        float alpha = smoothstep(
-            coverageThreshold + softness,
-            coverageThreshold - softness,
-            shape * densityBoost
-        );
-        
-        if (alpha <= 0.001) {
-            fragColor = baseColor;
-            return;
-        }
-        
-        vec3 cloudColor = vec3(1.0);
-        vec3 finalCol = mix(baseColor.rgb, cloudColor, alpha * horizonFade * 0.85); // 0.85 opacity max
-        
-        fragColor = vec4(finalCol, 1.0);
+        fragColor = vec4(mix(baseColor.rgb, baseColor.rgb * (1.0 - shadow * shadowStrength * 0.6 * mix(0.5, 1.0, weather.g)) + vec3(0.5, 0.65, 0.88) * baseColor.rgb * shadow * 0.3, totalShadowContinuity), 1.0);
     }
 `;
 
@@ -397,50 +538,25 @@ const fogShader = `
     uniform sampler2D colorTexture;
     uniform sampler2D depthTexture;
     uniform float fogDensity;
-    
+    uniform float cameraAltitude;
     in vec2 v_textureCoordinates;
     out vec4 fragColor;
-    
     void main() {
         vec2 uv = v_textureCoordinates;
         vec4 baseColor = texture(colorTexture, uv);
-        
-        if (fogDensity <= 0.0001) {
-            fragColor = baseColor;
-            return;
-        }
-        
+        if (fogDensity <= 0.0001) { fragColor = baseColor; return; }
         float depth = czm_readDepth(depthTexture, uv);
-        
-        vec4 positionEC = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
-        // Extract vector from camera to the pixel in world coordinates
-        vec3 offset = (czm_inverseViewRotation * positionEC.xyz);
-        
-        float dist = length(offset);
-        
-        if (depth >= 0.99999) {
-            dist = 20000.0; // Max fog distance for sky
-            offset = normalize(offset) * dist;
-        }
-        
-        // Simple distance-based exponential fog
-        float f = 1.0 - exp(-dist * fogDensity * 0.0001);
-        
-        // Height attenuation: safely calculate point altitude using camera altitude and vertical offset
+        vec4 rayEC = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec3 rayDirEC = normalize(rayEC.xyz / rayEC.w);
+        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
+        float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
+        float sceneT = sceneEyeZ / min(rayDirEC.z, -0.000001);
+        // Stabilize fog distance: snap large distances and clamp to 80km
+        if (depth >= 0.99999 || sceneT > 80000.0) sceneT = 80000.0; 
+        float f = 1.0 - exp(-sceneT * fogDensity * 0.0001);
         vec3 up = normalize(czm_viewerPositionWC);
-        float cameraAltitude = max(length(czm_viewerPositionWC) - 6378137.0, 0.0);
-        float pointAltitude = cameraAltitude + dot(offset, up);
-        
-        float heightFalloff = exp(-max(pointAltitude, 0.0) * 0.002);
-        
-        float finalFog = clamp(f * heightFalloff, 0.0, 1.0);
-        
-        float verticalDirection = dot(normalize(offset), up);
-        vec3 lowColor = vec3(0.5, 0.6, 0.7);
-        vec3 highColor = vec3(0.7, 0.8, 0.9);
-        vec3 fogColor = mix(lowColor, highColor, smoothstep(-0.2, 0.2, verticalDirection));
-        
-        fragColor = vec4(mix(baseColor.rgb, fogColor, finalFog), 1.0);
+        float finalFog = clamp(f * exp(-(cameraAltitude + dot(normalize(czm_inverseViewRotation * rayDirEC) * sceneT, up)) * 0.002), 0.0, 1.0);
+        fragColor = vec4(mix(baseColor.rgb, mix(vec3(0.5, 0.6, 0.7), vec3(0.7, 0.8, 0.9), smoothstep(-0.2, 0.2, dot(normalize(czm_inverseViewRotation * rayDirEC), up))), finalFog), 1.0);
     }
 `;
 
@@ -448,187 +564,56 @@ export class CesiumWeatherSystem {
     constructor(viewer, params) {
         this.viewer = viewer;
         this.params = params;
-        this.rainStage = null;
-        this.snowStage = null;
-        this.cloudStage = null;
-        this.fogStage = null;
         this.elapsedTime = 0;
-        
-        this.RAIN_AUDIO_URL = '/audio/rain-calming.mp3';
-        this.THUNDER_AUDIO_URL = '/audio/thunder-close.mp3';
         this.rainAudioPool = [];
         this.thunderAudioPool = [];
         this.rainAudioIsPlaying = false;
-        
         this.initPostProcess();
         this.initAudio();
-        
-        // Add update listener
         this.viewer.scene.preUpdate.addEventListener(this.update.bind(this));
     }
-    
     initPostProcess() {
         const scene = this.viewer.scene;
-        
-        // Rain Stage
-        this.rainStage = new PostProcessStage({
-            name: 'RainStage',
-            fragmentShader: rainShader,
-            uniforms: {
-                time: () => this.elapsedTime,
-                screenIntensity: () => this.params.rainScreenIntensity,
-                veilIntensity: () => this.params.rainVeilIntensity,
-                dropSize: () => this.params.rainDropSize,
-                rainSpeed: () => this.params.rainSpeed,
-                resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height)
-            }
-        });
-        this.rainStage.enabled = this.params.rainEnabled;
+        this.rainStage = new PostProcessStage({ name: 'RainStage', fragmentShader: rainShader, uniforms: { time: () => this.elapsedTime, screenIntensity: () => this.params.rainScreenIntensity, veilIntensity: () => this.params.rainVeilIntensity, dropSize: () => this.params.rainDropSize, rainSpeed: () => this.params.rainSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
         scene.postProcessStages.add(this.rainStage);
-        
-        // Snow Stage
-        this.snowStage = new PostProcessStage({
-            name: 'SnowStage',
-            fragmentShader: snowShader,
-            uniforms: {
-                time: () => this.elapsedTime,
-                intensity: () => this.params.snowIntensity,
-                snowSpeed: () => this.params.snowSpeed,
-                resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height)
-            }
-        });
-        this.snowStage.enabled = this.params.snowEnabled;
+        this.snowStage = new PostProcessStage({ name: 'SnowStage', fragmentShader: snowShader, uniforms: { time: () => this.elapsedTime, intensity: () => this.params.snowIntensity, snowSpeed: () => this.params.snowSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
         scene.postProcessStages.add(this.snowStage);
-        
-        // Cloud Stage
-        this.cloudStage = new PostProcessStage({
-            name: 'CloudStage',
-            fragmentShader: cloudShader,
-            uniforms: {
-                time: () => this.elapsedTime,
-                resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height),
-                cloudCoverage: () => this.params.cloudCoverage,
-                cloudDensity: () => this.params.cloudDensity,
-                cloudHeight: () => this.params.cloudHeight !== undefined ? this.params.cloudHeight : 6000.0,
-                scale: () => 4000.0,
-                detailScale: () => 4.5,
-                softness: () => 0.17,
-                drift: () => new Cartesian2(0.003, 0.001)
-            }
-        });
-        this.cloudStage.enabled = true; // Clouds are always "enabled", visibility controlled by coverage/density
+        this.cloudStage = new PostProcessStage({ name: 'CloudStage', fragmentShader: cloudShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudDensity: () => this.params.cloudDensity, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, detailScale: () => 3.8, softness: () => 0.12, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, atmosphereStrength: () => this.params.cloudAtmosphereStrength || 0.68, absorptionStrength: () => this.params.cloudAbsorptionStrength || 0.58, cameraAltitude: () => scene.camera.positionCartographic.height } });
         scene.postProcessStages.add(this.cloudStage);
-        
-        // Fog Stage
-        this.fogStage = new PostProcessStage({
-            name: 'FogStage',
-            fragmentShader: fogShader,
-            uniforms: {
-                fogDensity: () => this.params.fogEnabled ? this.params.fogDensity : 0.0
-            }
-        });
-        this.fogStage.enabled = true; // Controlled by fogDensity
+        this.cloudShadowStage = new PostProcessStage({ name: 'CloudShadowStage', fragmentShader: cloudShadowShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, shadowStrength: () => this.params.cloudShadowStrength || 0.42, cameraAltitude: () => scene.camera.positionCartographic.height } });
+        scene.postProcessStages.add(this.cloudShadowStage);
+        this.fogStage = new PostProcessStage({ name: 'FogStage', fragmentShader: fogShader, uniforms: { fogDensity: () => this.params.fogEnabled ? this.params.fogDensity : 0.0, cameraAltitude: () => scene.camera.positionCartographic.height } });
         scene.postProcessStages.add(this.fogStage);
-        
-        // Bloom
         scene.postProcessStages.bloom.enabled = true;
-        scene.postProcessStages.bloom.uniforms.contrast = 119;
-        scene.postProcessStages.bloom.uniforms.brightness = -0.4;
-        scene.postProcessStages.bloom.uniforms.glowOnly = false;
-        scene.postProcessStages.bloom.uniforms.delta = 1;
-        scene.postProcessStages.bloom.uniforms.sigma = 2;
-        scene.postProcessStages.bloom.uniforms.stepSize = 1;
     }
-    
     initAudio() {
-        this.rainAudioPool = Array.from({ length: 2 }, () => {
-            const audio = new Audio(this.RAIN_AUDIO_URL);
-            audio.loop = true;
-            audio.preload = 'auto';
-            audio.volume = 0;
-            audio.crossOrigin = 'anonymous';
-            return audio;
-        });
-
-        this.thunderAudioPool = Array.from({ length: 3 }, () => {
-            const audio = new Audio(this.THUNDER_AUDIO_URL);
-            audio.preload = 'auto';
-            audio.crossOrigin = 'anonymous';
-            return audio;
-        });
+        this.rainAudioPool = Array.from({ length: 2 }, () => { const a = new Audio('/audio/rain-calming.mp3'); a.loop = true; a.preload = 'auto'; a.volume = 0; a.crossOrigin = 'anonymous'; return a; });
+        this.thunderAudioPool = Array.from({ length: 3 }, () => { const a = new Audio('/audio/thunder-close.mp3'); a.preload = 'auto'; a.crossOrigin = 'anonymous'; return a; });
     }
-
-    updateAudioVolume() {
-        if (!this.params.rainAudioEnabled || !this.params.rainEnabled) {
-            this.rainAudioPool.forEach(a => {
-                a.volume = 0;
-                a.pause();
-            });
-            this.rainAudioIsPlaying = false;
-            return;
-        }
-        
-        if (!this.rainAudioIsPlaying) {
-            this.rainAudioPool[0].play().catch(() => {});
-            this.rainAudioIsPlaying = true;
-        }
-        this.rainAudioPool[0].volume = this.params.rainAudioVolume;
-    }
-
     update(scene, time) {
-        // Simple elapsed time delta
-        this.elapsedTime += 0.016; 
-        
+        this.elapsedTime += 0.016;
         this.rainStage.enabled = Boolean(this.params.rainEnabled);
         this.snowStage.enabled = Boolean(this.params.snowEnabled);
-        
-        // Update audio
-        this.updateAudioVolume();
-        
-        // Update bloom based on sun elevation mapping
-        // In Cesium bloom behaves slightly differently, so we map Three's bloom params
+        this.cloudShadowStage.enabled = (this.params.cloudShadowStrength || 0) > 0.001;
+        if (this.params.rainAudioEnabled && this.params.rainEnabled) {
+            if (!this.rainAudioIsPlaying) { this.rainAudioPool[0].play().catch(() => {}); this.rainAudioIsPlaying = true; }
+            this.rainAudioPool[0].volume = this.params.rainAudioVolume;
+        } else {
+            this.rainAudioPool.forEach(a => { a.volume = 0; a.pause(); });
+            this.rainAudioIsPlaying = false;
+        }
         if (this.params.bloomStrength > 0) {
             scene.postProcessStages.bloom.enabled = true;
-            // Rough mapping
             scene.postProcessStages.bloom.uniforms.contrast = 120 + this.params.bloomStrength * 80;
             scene.postProcessStages.bloom.uniforms.sigma = 1 + this.params.bloomRadius * 2;
-        } else {
-            scene.postProcessStages.bloom.enabled = false;
-        }
-        
-        // Lightning flashes 
-        if (this.params.lightningEnabled && this.params.rainEnabled && Math.random() < 0.005) {
-            this.triggerLightning();
-        }
+        } else { scene.postProcessStages.bloom.enabled = false; }
+        if (this.params.lightningEnabled && this.params.rainEnabled && Math.random() < 0.005) { this.triggerLightning(); }
     }
-    
     triggerLightning() {
-        // Play thunder sound
-        const thunder = this.thunderAudioPool.find(a => a.paused || a.ended);
-        if (thunder && this.params.rainAudioEnabled) {
-            thunder.volume = this.params.thunderVolume || 0.8;
-            thunder.currentTime = 0;
-            thunder.play().catch(() => {});
-        }
-        
-        // Flash light modifier
-        const originalIntensity = this.viewer.scene.light.intensity;
+        const t = this.thunderAudioPool.find(a => a.paused || a.ended);
+        if (t && this.params.rainAudioEnabled) { t.volume = this.params.thunderVolume || 0.8; t.currentTime = 0; t.play().catch(() => {}); }
+        const intensity = this.viewer.scene.light.intensity;
         this.viewer.scene.light.intensity = this.params.lightningIntensity * 5.0 || 5.0;
-        
-        setTimeout(() => {
-            if (this.viewer && this.viewer.scene) {
-                this.viewer.scene.light.intensity = originalIntensity;
-            }
-        }, 150);
-        setTimeout(() => {
-            if (this.viewer && this.viewer.scene && Math.random() > 0.5) {
-                this.viewer.scene.light.intensity = this.params.lightningIntensity * 3.0 || 3.0;
-                setTimeout(() => {
-                    if (this.viewer && this.viewer.scene) {
-                        this.viewer.scene.light.intensity = originalIntensity;
-                    }
-                }, 50);
-            }
-        }, 200);
+        setTimeout(() => { if (this.viewer && this.viewer.scene) this.viewer.scene.light.intensity = intensity; }, 150);
     }
 }

@@ -22,11 +22,10 @@ class CesiumWeatherApp {
         this.container = container;
         this.viewer = null;
         this.gui = null;
-        this.params = { ...DEFAULT_SCENE_PARAMS, cloudHeight: 6000 };
+        this.params = { ...DEFAULT_SCENE_PARAMS };
     }
 
     async init() {
-
         const terrainProvider = await this.createTerrainProvider();
         this.viewer = new Viewer(this.container, {
             terrainProvider,
@@ -49,7 +48,6 @@ class CesiumWeatherApp {
         this.weatherSystem = new CesiumWeatherSystem(this.viewer, this.params);
 
         await this.setupBaseLayer();
-
         this.setupCamera();
         this.applyParams(this.params);
     }
@@ -58,7 +56,7 @@ class CesiumWeatherApp {
         try {
             return await createWorldTerrainAsync();
         } catch (error) {
-            console.warn('WorldTerrain 加载失败，回退到椭球地形。', error);
+            console.warn('WorldTerrain load failed, falling back to ellipsoid terrain.', error);
             return new EllipsoidTerrainProvider();
         }
     }
@@ -90,52 +88,51 @@ class CesiumWeatherApp {
     }
 
     setupControls() {
-        const gui = new GUI({ title: 'Cesium 天气控制' });
+        const gui = new GUI({ title: 'Cesium Weather' });
         gui.domElement.style.marginTop = '12px';
         gui.domElement.style.marginRight = '12px';
         gui.domElement.style.zIndex = '120';
         this.gui = gui;
 
-        const presetState = { 预设: 'default' };
-        gui.add(presetState, '预设', Object.keys(WEATHER_PRESETS))
-            .name('天气预设')
+        const presetState = { preset: 'default' };
+        gui.add(presetState, 'preset', Object.keys(WEATHER_PRESETS))
+            .name('Weather Preset')
             .onChange((presetKey) => {
                 this.applyParams(WEATHER_PRESETS[presetKey].params);
                 this.refreshGui();
             });
 
-        const skyFolder = gui.addFolder('天空与光照');
-        skyFolder.add(this.params, 'elevation', -12, 90, 0.1).name('太阳高度').onChange(() => this.applyParams(this.params));
-        skyFolder.add(this.params, 'azimuth', -180, 180, 0.1).name('太阳方位').onChange(() => this.applyParams(this.params));
-        skyFolder.add(this.params, 'exposure', 0, 1, 0.01).name('曝光').onChange(() => this.applyParams(this.params));
-        skyFolder.add(this.params, 'rayleigh', 0, 4, 0.01).name('瑞利散射').onChange(() => this.applyParams(this.params));
+        const skyFolder = gui.addFolder('Sky');
+        skyFolder.add(this.params, 'elevation', -12, 90, 0.1).name('Sun Elevation').onChange(() => this.applyParams(this.params));
+        skyFolder.add(this.params, 'azimuth', -180, 180, 0.1).name('Sun Azimuth').onChange(() => this.applyParams(this.params));
+        skyFolder.add(this.params, 'exposure', 0, 1, 0.01).name('Exposure').onChange(() => this.applyParams(this.params));
+        skyFolder.add(this.params, 'rayleigh', 0, 4, 0.01).name('Rayleigh').onChange(() => this.applyParams(this.params));
 
-        // 泛光文件夹
-        const bloomFolder = gui.addFolder('泛光 (Bloom)');
-        bloomFolder.add(this.params, 'bloomStrength', 0, 1, 0.01).name('泛光强度').onChange(() => this.applyParams(this.params));
-        bloomFolder.add(this.params, 'bloomRadius', 0, 3, 0.01).name('泛光扩散').onChange(() => this.applyParams(this.params));
+        const bloomFolder = gui.addFolder('Bloom');
+        bloomFolder.add(this.params, 'bloomStrength', 0, 1, 0.01).name('Strength').onChange(() => this.applyParams(this.params));
+        bloomFolder.add(this.params, 'bloomRadius', 0, 3, 0.01).name('Radius').onChange(() => this.applyParams(this.params));
 
-        // 云层文件夹
-        const cloudFolder = gui.addFolder('云层 (Clouds)');
-        cloudFolder.add(this.params, 'cloudCoverage', 0, 1, 0.01).name('云层覆盖度').onChange(() => this.applyParams(this.params));
-        cloudFolder.add(this.params, 'cloudDensity', 0, 1, 0.01).name('云层密度').onChange(() => this.applyParams(this.params));
-        cloudFolder.add(this.params, 'cloudHeight', 500, 10000, 100).name('云层高度').onChange(() => this.applyParams(this.params));
+        const cloudFolder = gui.addFolder('Clouds');
+        cloudFolder.add(this.params, 'cloudCoverage', 0, 1, 0.01).name('Coverage').onChange(() => this.applyParams(this.params));
+        cloudFolder.add(this.params, 'cloudDensity', 0, 1, 0.01).name('Density').onChange(() => this.applyParams(this.params));
+        cloudFolder.add(this.params, 'cloudBaseHeight', 500, 12000, 100).name('Base Height').onChange(() => this.applyParams(this.params));
+        cloudFolder.add(this.params, 'cloudTopHeight', 1000, 16000, 100).name('Top Height').onChange(() => this.applyParams(this.params));
 
-        const fogFolder = gui.addFolder('雾效 (Fog)');
-        fogFolder.add(this.params, 'fogEnabled').name('启用雾').onChange(() => this.applyParams(this.params));
-        fogFolder.add(this.params, 'fogDensity', 0, 2, 0.01).name('雾浓度').onChange(() => this.applyParams(this.params));
+        const fogFolder = gui.addFolder('Fog');
+        fogFolder.add(this.params, 'fogEnabled').name('Enabled').onChange(() => this.applyParams(this.params));
+        fogFolder.add(this.params, 'fogDensity', 0, 2, 0.01).name('Density').onChange(() => this.applyParams(this.params));
 
-        const rainFolder = gui.addFolder('雨效 (Rain)');
-        rainFolder.add(this.params, 'rainEnabled').name('启用降雨').onChange(() => this.applyParams(this.params));
-        rainFolder.add(this.params, 'rainVeilIntensity', 0.5, 2.5, 0.01).name('雨线强度').onChange(() => this.applyParams(this.params));
-        rainFolder.add(this.params, 'rainAudioEnabled').name('启用雨声').onChange(() => this.applyParams(this.params));
-        rainFolder.add(this.params, 'rainAudioVolume', 0, 1, 0.01).name('雨声音量').onChange(() => this.applyParams(this.params));
-        rainFolder.add(this.params, 'lightningEnabled').name('启用雷闪').onChange(() => this.applyParams(this.params));
+        const rainFolder = gui.addFolder('Rain');
+        rainFolder.add(this.params, 'rainEnabled').name('Enabled').onChange(() => this.applyParams(this.params));
+        rainFolder.add(this.params, 'rainVeilIntensity', 0.5, 2.5, 0.01).name('Veil').onChange(() => this.applyParams(this.params));
+        rainFolder.add(this.params, 'rainAudioEnabled').name('Audio').onChange(() => this.applyParams(this.params));
+        rainFolder.add(this.params, 'rainAudioVolume', 0, 1, 0.01).name('Audio Volume').onChange(() => this.applyParams(this.params));
+        rainFolder.add(this.params, 'lightningEnabled').name('Lightning').onChange(() => this.applyParams(this.params));
 
-        const snowFolder = gui.addFolder('雪效 (Snow)');
-        snowFolder.add(this.params, 'snowEnabled').name('启用降雪').onChange(() => this.applyParams(this.params));
-        snowFolder.add(this.params, 'snowIntensity', 0, 1.5, 0.01).name('雪量').onChange(() => this.applyParams(this.params));
-        snowFolder.add(this.params, 'snowSpeed', 0.2, 2.2, 0.01).name('速度').onChange(() => this.applyParams(this.params));
+        const snowFolder = gui.addFolder('Snow');
+        snowFolder.add(this.params, 'snowEnabled').name('Enabled').onChange(() => this.applyParams(this.params));
+        snowFolder.add(this.params, 'snowIntensity', 0, 1.5, 0.01).name('Intensity').onChange(() => this.applyParams(this.params));
+        snowFolder.add(this.params, 'snowSpeed', 0.2, 2.2, 0.01).name('Speed').onChange(() => this.applyParams(this.params));
 
         [skyFolder, bloomFolder, cloudFolder, fogFolder, rainFolder, snowFolder].forEach((folder) => folder.close());
     }
@@ -147,10 +144,14 @@ class CesiumWeatherApp {
 
     applyParams(nextParams) {
         Object.assign(this.params, nextParams);
-        const scene = this.viewer.scene;
+        if (this.params.cloudTopHeight <= this.params.cloudBaseHeight + 100.0) {
+            this.params.cloudTopHeight = this.params.cloudBaseHeight + 100.0;
+        }
 
+        const scene = this.viewer.scene;
         scene.highDynamicRange = this.params.exposure > 0.2;
         scene.globe.enableLighting = true;
+        scene.globe.depthTestAgainstTerrain = true; // CRITICAL: This allows mountains to be written to the depth buffer for cloud occlusion!
 
         scene.fog.enabled = Boolean(this.params.fogEnabled);
         scene.fog.density = CesiumMath.lerp(0.00002, 0.0012, CesiumMath.clamp(this.params.fogDensity / 2, 0, 1));
@@ -171,7 +172,6 @@ class CesiumWeatherApp {
             Math.sin(elevationRad)
         );
 
-        // Transform to global ECEF using target location origin (Shanghai)
         const origin = Cartesian3.fromDegrees(121.4737, 31.2304, 0);
         const enuMatrix = Transforms.eastNorthUpToFixedFrame(origin);
 
@@ -213,13 +213,13 @@ export async function startCesium() {
         hideLoading();
         window.__CESIUM_APP__ = app;
     } catch (error) {
-        console.error('Cesium 场景加载失败:', error);
+        console.error('Cesium scene failed to load:', error);
         const loading = document.getElementById('loading');
         if (loading) {
             loading.innerHTML = `
-                <h1 style="color: #ff6b6b;">Cesium 加载失败</h1>
+                <h1 style="color: #ff6b6b;">Cesium load failed</h1>
                 <p style="margin-top: 20px; opacity: 0.8;">${error.message}</p>
-                <p style="margin-top: 10px; opacity: 0.6;">请检查网络和 Cesium 资源配置</p>
+                <p style="margin-top: 10px; opacity: 0.6;">Check network access and Cesium asset setup.</p>
             `;
         }
         throw error;
