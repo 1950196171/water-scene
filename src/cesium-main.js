@@ -78,7 +78,7 @@ class CesiumWeatherApp {
 
     setupCamera() {
         this.viewer.scene.camera.setView({
-            destination: Cartesian3.fromDegrees(121.4737, 31.2304, 12000),
+            destination: Cartesian3.fromDegrees(121.4737, 31.2304, 2000),
             orientation: new HeadingPitchRoll(
                 CesiumMath.toRadians(0),
                 CesiumMath.toRadians(-25),

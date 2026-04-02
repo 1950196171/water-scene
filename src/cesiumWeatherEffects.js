@@ -279,7 +279,6 @@ const cloudShader = `
     uniform sampler2D weatherTexture;
     uniform float time;
     uniform vec2 resolution;
-    
     uniform float cameraAltitude;
     uniform float cloudCoverage;
     uniform float cloudDensity;
@@ -338,7 +337,12 @@ const cloudShader = `
     void main() {
         vec2 uv = v_textureCoordinates;
         vec4 baseColor = texture(colorTexture, uv);
-        float depth = czm_readDepth(depthTexture, uv);
+        vec2 px = 1.0 / resolution;
+        float depth1 = czm_readDepth(depthTexture, uv);
+        float depth2 = czm_readDepth(depthTexture, uv + vec2(px.x, 0.0));
+        float depth3 = czm_readDepth(depthTexture, uv + vec2(0.0, px.y));
+        float depth4 = czm_readDepth(depthTexture, uv + px);
+        float depth = min(min(depth1, depth2), min(depth3, depth4));
         
         vec4 clipPos = vec4(uv * 2.0 - 1.0, 1.0, 1.0);
         vec4 farEC = czm_inverseProjection * clipPos;
@@ -350,51 +354,32 @@ const cloudShader = `
         vec2 shellBase = raySphereIntersect(cameraAltitude, cloudBaseHeight, rayDirY);
         vec2 shellTop  = raySphereIntersect(cameraAltitude, cloudTopHeight,  rayDirY);
         
-        // ─── UNIFIED BRANCHLESS INTERSECTION ────────────────────────────────────
-        // Calculate all intersection pairs.
-        // shellBase.x refers to the entry point into the atmospheric shell.
-        // We find the entry/exit points that overlap with the cloud layer (base to top).
         float t0 = (cameraAltitude < cloudBaseHeight) ? shellBase.y : (cameraAltitude > cloudTopHeight) ? shellTop.x : 0.0;
         float t1 = (cameraAltitude < cloudBaseHeight) ? shellTop.y  : (cameraAltitude > cloudTopHeight) ? shellBase.x : shellTop.y;
         
-        // Final unified stability interval
         float tMin = max(t0, 0.0);
         float tMax = max(t1, 0.0);
-        // ──────────────────────────────────────────────────────────────────────────
         
         tMin = max(tMin, 0.0);
         const float maxVisualDist = 2000000.0;
         if (tMin > maxVisualDist || tMax < 0.0) { fragColor = baseColor; return; }
         tMax = min(tMax, maxVisualDist);
         
-        // Synchronized Eye-Space Depth: Reconstruct eye-Z using native functions.
-        // By comparing sceneEyeZ with rayEyeZ (both derived from the same matrix),
-        // we ensure that multi-frustum jitter cancels out perfectly.
         vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
         float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
         
         float cloudShellTMax = tMax;
         
-        // ─── TOTAL CONTINUITY WEIGHTS ───────────────────────────────────────────
-        // Instead of binary 'return' paths, we use smooth weights that modulate 
-        // the final cloud contribution. This prevents all full-layer flashes.
-        
-        // 1. Horizon Smooth Cutoff: Naturally fades clouds near/below horizon.
         float horizonContinuity = smoothstep(-0.08, 0.02, rayDirY);
-        
-        // 2. Distance Smooth Cutoff: Naturally fades극 far clouds.
         const float VISUAL_MAX = 1500000.0;
         float distContinuity = smoothstep(VISUAL_MAX, VISUAL_MAX * 0.8, tMin);
         
-        // Combined continuity multiplier
         float totalContinuity = horizonContinuity * distContinuity;
         if (totalContinuity <= 0.001 || tMin >= cloudShellTMax) { fragColor = baseColor; return; }
         
         const float FIXED_STEP = 250.0;
         const int MAX_STEPS = 56;
         
-        // Stable Start: No more grid snapping. 
-        // Dithering helps mask depth precision issues.
         float t = tMin + fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453) * 5.0;
         
         float transmittance = 1.0;
@@ -423,9 +408,8 @@ const cloudShader = `
         vec2 flowOffset = drift * time * 50.0;
         for (int i = 0; i < MAX_STEPS; i++) {
             if (t > cloudShellTMax || transmittance < 0.02) break;
-            // Soft Occlusion Factor: fixed 500m smoothing in eye-space.
-            // (t * rayEC.z) is the eye-Z of the current sampling point.
-            float occlusionWeight = (depth < 1.0) ? smoothstep(sceneEyeZ, sceneEyeZ - 500.0 * abs(rayEC.z), t * rayEC.z) : 1.0;
+            // Correct Occlusion: If rayZ is farther (more negative) than sceneZ, weight is 0.
+            float occlusionWeight = (depth < 1.0) ? smoothstep(sceneEyeZ - 500.0 * abs(rayEC.z), sceneEyeZ, t * rayEC.z) : 1.0;
             float h = cameraAltitude + t * rayDirY + (t * t) / (2.0 * R_earth);
             
             vec3 sampleDir = normalize(camNormW + (t / camR) * rayDir);
@@ -458,7 +442,6 @@ const cloudShader = `
             t += FIXED_STEP;
         }
         transmittance = mix(1.0, transmittance, horizonFade);
-        // Apply Totality Continuity weight (horizon/dist/occlusion combo)
         float finalOpacity = (1.0 - transmittance) * totalContinuity;
         fragColor = vec4(mix(baseColor.rgb, baseColor.rgb * transmittance + scatteredLight * horizonFade, totalContinuity), 1.0);
     }
@@ -485,14 +468,20 @@ const cloudShadowShader = `
     void main() {
         vec2 uv = v_textureCoordinates;
         vec4 baseColor = texture(colorTexture, uv);
-        float depth = czm_readDepth(depthTexture, uv);
+        vec2 px = 1.0 / resolution;
+        float depth1 = czm_readDepth(depthTexture, uv);
+        float depth2 = czm_readDepth(depthTexture, uv + vec2(px.x, 0.0));
+        float depth3 = czm_readDepth(depthTexture, uv + vec2(0.0, px.y));
+        float depth4 = czm_readDepth(depthTexture, uv + px);
+        float depth = min(min(depth1, depth2), min(depth3, depth4));
+        
         vec4 rayEC = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
         vec3 rayDirEC = normalize(rayEC.xyz / rayEC.w);
         vec3 rayDir = normalize(czm_inverseViewRotation * rayDirEC);
         vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
         float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
         float sceneT = sceneEyeZ / min(rayDirEC.z, -0.000001);
-        // Sanity clamp: anything too far isn't ground for shadows.
+        // Correct Shadow Occlusion Bias: ensures shadows only appear on ground in front of sky.
         if (depth >= 0.99999 || sceneT > 40000.0) sceneT = 40000.0; 
         
         vec3 offset = rayDir * sceneT;
@@ -539,13 +528,20 @@ const fogShader = `
     uniform sampler2D depthTexture;
     uniform float fogDensity;
     uniform float cameraAltitude;
+    uniform vec2 resolution;
     in vec2 v_textureCoordinates;
     out vec4 fragColor;
     void main() {
         vec2 uv = v_textureCoordinates;
         vec4 baseColor = texture(colorTexture, uv);
         if (fogDensity <= 0.0001) { fragColor = baseColor; return; }
-        float depth = czm_readDepth(depthTexture, uv);
+        // 4-Tap Min-Depth Filter for fog stability
+        vec2 px = 1.0 / resolution;
+        float depth1 = czm_readDepth(depthTexture, uv);
+        float depth2 = czm_readDepth(depthTexture, uv + vec2(px.x, 0.0));
+        float depth3 = czm_readDepth(depthTexture, uv + vec2(0.0, px.y));
+        float depth4 = czm_readDepth(depthTexture, uv + px);
+        float depth = min(min(depth1, depth2), min(depth3, depth4));
         vec4 rayEC = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
         vec3 rayDirEC = normalize(rayEC.xyz / rayEC.w);
         vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
@@ -574,16 +570,21 @@ export class CesiumWeatherSystem {
     }
     initPostProcess() {
         const scene = this.viewer.scene;
+        // Clean slate to prevent stage accumulation during hot-reloads
+        scene.postProcessStages.removeAll();
+        
         this.rainStage = new PostProcessStage({ name: 'RainStage', fragmentShader: rainShader, uniforms: { time: () => this.elapsedTime, screenIntensity: () => this.params.rainScreenIntensity, veilIntensity: () => this.params.rainVeilIntensity, dropSize: () => this.params.rainDropSize, rainSpeed: () => this.params.rainSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
-        scene.postProcessStages.add(this.rainStage);
         this.snowStage = new PostProcessStage({ name: 'SnowStage', fragmentShader: snowShader, uniforms: { time: () => this.elapsedTime, intensity: () => this.params.snowIntensity, snowSpeed: () => this.params.snowSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
-        scene.postProcessStages.add(this.snowStage);
         this.cloudStage = new PostProcessStage({ name: 'CloudStage', fragmentShader: cloudShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudDensity: () => this.params.cloudDensity, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, detailScale: () => 3.8, softness: () => 0.12, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, atmosphereStrength: () => this.params.cloudAtmosphereStrength || 0.68, absorptionStrength: () => this.params.cloudAbsorptionStrength || 0.58, cameraAltitude: () => scene.camera.positionCartographic.height } });
-        scene.postProcessStages.add(this.cloudStage);
         this.cloudShadowStage = new PostProcessStage({ name: 'CloudShadowStage', fragmentShader: cloudShadowShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, shadowStrength: () => this.params.cloudShadowStrength || 0.42, cameraAltitude: () => scene.camera.positionCartographic.height } });
+        this.fogStage = new PostProcessStage({ name: 'FogStage', fragmentShader: fogShader, uniforms: { fogDensity: () => this.params.fogEnabled ? this.params.fogDensity : 0.0, cameraAltitude: () => scene.camera.positionCartographic.height, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
+        
+        // Correct Execution Order: Clouds -> Shadows -> Fog -> Rain -> Snow
+        scene.postProcessStages.add(this.cloudStage);
         scene.postProcessStages.add(this.cloudShadowStage);
-        this.fogStage = new PostProcessStage({ name: 'FogStage', fragmentShader: fogShader, uniforms: { fogDensity: () => this.params.fogEnabled ? this.params.fogDensity : 0.0, cameraAltitude: () => scene.camera.positionCartographic.height } });
         scene.postProcessStages.add(this.fogStage);
+        scene.postProcessStages.add(this.rainStage);
+        scene.postProcessStages.add(this.snowStage);
         scene.postProcessStages.bloom.enabled = true;
     }
     initAudio() {
