@@ -1,5 +1,5 @@
-import { PostProcessStage, Color, Matrix4, Cartesian3, Math as CesiumMath, Cartesian2 } from 'cesium';
-import { WEATHER_PRESETS } from './weatherPresets.js';
+import { PostProcessStage, PostProcessStageComposite, Color, Matrix4, Cartesian3, Math as CesiumMath, Cartesian2 } from 'cesium';
+import { DEFAULT_SCENE_PARAMS, WEATHER_PRESETS } from './weatherPresets.js';
 
 const rainShader = `
     uniform sampler2D colorTexture;
@@ -294,6 +294,17 @@ const cloudShader = `
     
     in vec2 v_textureCoordinates;
     out vec4 fragColor;
+
+    vec4 pixelToEye(vec2 screenCoordinate, float depth) {
+        vec2 uv = screenCoordinate / czm_viewport.zw;
+        vec2 xy = 2.0 * uv - vec2(1.0);
+        vec4 posEC = czm_inverseProjection * vec4(xy, depth, 1.0);
+        posEC = posEC / posEC.w;
+        if (depth >= 1.0) {
+            posEC.z = -czm_currentFrustum.y;
+        }
+        return posEC;
+    }
     
     vec2 raySphereIntersect(float camAlt, float H, float rayDirY) {
         float R = 6378137.0;
@@ -337,7 +348,8 @@ const cloudShader = `
     void main() {
         vec2 uv = v_textureCoordinates;
         vec4 baseColor = texture(colorTexture, uv);
-        vec2 px = 1.0 / resolution;
+        vec2 screenCoord = gl_FragCoord.xy;
+        vec2 px = 1.0 / czm_viewport.zw;
         float depth1 = czm_readDepth(depthTexture, uv);
         float depth2 = czm_readDepth(depthTexture, uv + vec2(px.x, 0.0));
         float depth3 = czm_readDepth(depthTexture, uv + vec2(0.0, px.y));
@@ -365,16 +377,23 @@ const cloudShader = `
         if (tMin > maxVisualDist || tMax < 0.0) { fragColor = baseColor; return; }
         tMax = min(tMax, maxVisualDist);
         
-        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
-        float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
-        
         float cloudShellTMax = tMax;
+        float sceneDistance = 1.0e9;
+        bool hasSceneHit = depth > 0.0 && depth < 0.99999;
+        const float OCCLUSION_BIAS = 40.0;
+        const float OCCLUSION_SOFTNESS = 220.0;
+        if (hasSceneHit) {
+            vec3 sceneEyePos = pixelToEye(screenCoord, depth).xyz;
+            sceneDistance = length(sceneEyePos);
+            cloudShellTMax = min(cloudShellTMax, sceneDistance + OCCLUSION_SOFTNESS);
+        }
         
         float horizonContinuity = smoothstep(-0.08, 0.02, rayDirY);
         const float VISUAL_MAX = 1500000.0;
         float distContinuity = smoothstep(VISUAL_MAX, VISUAL_MAX * 0.8, tMin);
         
         float totalContinuity = horizonContinuity * distContinuity;
+        if (hasSceneHit && sceneDistance <= tMin + OCCLUSION_BIAS) { fragColor = baseColor; return; }
         if (totalContinuity <= 0.001 || tMin >= cloudShellTMax) { fragColor = baseColor; return; }
         
         const float FIXED_STEP = 250.0;
@@ -386,7 +405,7 @@ const cloudShader = `
         vec3 scatteredLight = vec3(0.0);
         vec3 sunDir = normalize(sunDirection);
         float cosSun = dot(rayDir, sunDir);
-        float g1 = 0.85; float g2 = -0.25;
+        float g1 = 0.92; float g2 = -0.25;
         float hg1 = (1.0 - g1*g1) / pow(1.0 + g1*g1 - 2.0*g1*cosSun, 1.5);
         float hg2 = (1.0 - g2*g2) / pow(1.0 + g2*g2 - 2.0*g2*cosSun, 1.5);
         float phaseForward = 0.5 + mix(hg2, hg1, 0.65) * 0.079577 * 3.5;
@@ -395,8 +414,8 @@ const cloudShader = `
         float atmSunDown = clamp(-dot(sunDir, up), 0.0, 1.0);
         vec3 sunLightColor = mix(vec3(1.0, 0.45, 0.15), vec3(0.98, 0.96, 0.94), smoothstep(0.0, 0.3, atmSunUp));
         vec3 ambientColor = mix(vec3(0.35, 0.45, 0.65), vec3(0.56, 0.64, 0.78), atmSunUp);
-        vec3 atmosphereColor = mix(vec3(0.2, 0.3, 0.5), vec3(0.6, 0.75, 0.9), viewUp) * (0.4 + 0.6 * atmSunUp) + sunLightColor * pow(max(cosSun, 0.0), 6.0) * 0.5;
-        float absorptionCoeff = mix(0.5, 3.5, clamp(absorptionStrength, 0.0, 1.0));
+        vec3 atmosphereColor = mix(vec3(0.2, 0.3, 0.5), vec3(0.6, 0.75, 0.9), viewUp) * (0.4 + 0.6 * atmSunUp) + sunLightColor * pow(max(cosSun, 0.0), 40.0) * 0.4;
+        float absorptionCoeff = mix(0.35, 2.3, clamp(absorptionStrength, 0.0, 1.0));
         float densBoost = mix(0.5, 4.0, clamp(cloudDensity, 0.0, 1.0));
         float covThreshold = mix(0.7, 0.2, clamp(cloudCoverage, 0.0, 1.0));
         float horizonFade = smoothstep(0.0, 0.05, rayDirY);
@@ -408,8 +427,8 @@ const cloudShader = `
         vec2 flowOffset = drift * time * 50.0;
         for (int i = 0; i < MAX_STEPS; i++) {
             if (t > cloudShellTMax || transmittance < 0.02) break;
-            // Correct Occlusion: If rayZ is farther (more negative) than sceneZ, weight is 0.
-            float occlusionWeight = (depth < 1.0) ? smoothstep(sceneEyeZ - 500.0 * abs(rayEC.z), sceneEyeZ, t * rayEC.z) : 1.0;
+            float occlusionWeight = hasSceneHit ? (1.0 - smoothstep(sceneDistance - OCCLUSION_SOFTNESS, sceneDistance - OCCLUSION_BIAS, t)) : 1.0;
+            if (occlusionWeight <= 0.001) break;
             float h = cameraAltitude + t * rayDirY + (t * t) / (2.0 * R_earth);
             
             vec3 sampleDir = normalize(camNormW + (t / camR) * rayDir);
@@ -478,7 +497,7 @@ const cloudShadowShader = `
         vec4 rayEC = czm_inverseProjection * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
         vec3 rayDirEC = normalize(rayEC.xyz / rayEC.w);
         vec3 rayDir = normalize(czm_inverseViewRotation * rayDirEC);
-        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
+        vec4 eyePos = czm_windowToEyeCoordinates(gl_FragCoord.xy * resolution, depth);
         float sceneEyeZ = eyePos.z / max(eyePos.w, 0.000001);
         float sceneT = sceneEyeZ / min(rayDirEC.z, -0.000001);
         // Correct Shadow Occlusion Bias: ensures shadows only appear on ground in front of sky.
@@ -564,22 +583,24 @@ export class CesiumWeatherSystem {
         this.rainAudioPool = [];
         this.thunderAudioPool = [];
         this.rainAudioIsPlaying = false;
+        this._onPreUpdate = this.update.bind(this);
+
         this.initPostProcess();
         this.initAudio();
-        this.viewer.scene.preUpdate.addEventListener(this.update.bind(this));
+        this.viewer.scene.preUpdate.addEventListener(this._onPreUpdate);
     }
     initPostProcess() {
         const scene = this.viewer.scene;
         // Clean slate to prevent stage accumulation during hot-reloads
         scene.postProcessStages.removeAll();
-        
+
         this.rainStage = new PostProcessStage({ name: 'RainStage', fragmentShader: rainShader, uniforms: { time: () => this.elapsedTime, screenIntensity: () => this.params.rainScreenIntensity, veilIntensity: () => this.params.rainVeilIntensity, dropSize: () => this.params.rainDropSize, rainSpeed: () => this.params.rainSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
         this.snowStage = new PostProcessStage({ name: 'SnowStage', fragmentShader: snowShader, uniforms: { time: () => this.elapsedTime, intensity: () => this.params.snowIntensity, snowSpeed: () => this.params.snowSpeed, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
-        this.cloudStage = new PostProcessStage({ name: 'CloudStage', fragmentShader: cloudShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudDensity: () => this.params.cloudDensity, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, detailScale: () => 3.8, softness: () => 0.12, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, atmosphereStrength: () => this.params.cloudAtmosphereStrength || 0.68, absorptionStrength: () => this.params.cloudAbsorptionStrength || 0.58, cameraAltitude: () => scene.camera.positionCartographic.height } });
+        this.cloudStage = new PostProcessStage({ name: 'CloudStage', fragmentShader: cloudShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudDensity: () => this.params.cloudDensity, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, detailScale: () => 3.8, softness: () => 0.12, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, atmosphereStrength: () => this.params.cloudAtmosphereStrength ?? 0.68, absorptionStrength: () => this.params.cloudAbsorptionStrength ?? 0.42, cameraAltitude: () => scene.camera.positionCartographic.height } });
         this.cloudShadowStage = new PostProcessStage({ name: 'CloudShadowStage', fragmentShader: cloudShadowShader, uniforms: { cloudMask: '/textures/cloud-mask.png', weatherTexture: '/textures/weather3.png', time: () => this.elapsedTime, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height), cloudCoverage: () => this.params.cloudCoverage, cloudBaseHeight: () => this.params.cloudBaseHeight || 1500.0, cloudTopHeight: () => this.params.cloudTopHeight || 6000.0, scale: () => 90000.0, drift: () => new Cartesian2(0.003, 0.001), sunDirection: () => { const l = scene.light; if (l && l.direction) { const d = Cartesian3.negate(l.direction, new Cartesian3()); return Cartesian3.normalize(d, d); } return Cartesian3.normalize(new Cartesian3(0.35, 0.25, 0.9), new Cartesian3()); }, shadowStrength: () => this.params.cloudShadowStrength || 0.42, cameraAltitude: () => scene.camera.positionCartographic.height } });
         this.fogStage = new PostProcessStage({ name: 'FogStage', fragmentShader: fogShader, uniforms: { fogDensity: () => this.params.fogEnabled ? this.params.fogDensity : 0.0, cameraAltitude: () => scene.camera.positionCartographic.height, resolution: () => new Cartesian2(scene.canvas.width, scene.canvas.height) } });
-        
-        // Correct Execution Order: Clouds -> Shadows -> Fog -> Rain -> Snow
+
+        // Restore Individual Stages: guaranteed visibility across all Cesium versions.
         scene.postProcessStages.add(this.cloudStage);
         scene.postProcessStages.add(this.cloudShadowStage);
         scene.postProcessStages.add(this.fogStage);
@@ -591,13 +612,28 @@ export class CesiumWeatherSystem {
         this.rainAudioPool = Array.from({ length: 2 }, () => { const a = new Audio('/audio/rain-calming.mp3'); a.loop = true; a.preload = 'auto'; a.volume = 0; a.crossOrigin = 'anonymous'; return a; });
         this.thunderAudioPool = Array.from({ length: 3 }, () => { const a = new Audio('/audio/thunder-close.mp3'); a.preload = 'auto'; a.crossOrigin = 'anonymous'; return a; });
     }
+    setParams(nextParams = {}) {
+        Object.assign(this.params, nextParams);
+        if (this.params.cloudTopHeight <= this.params.cloudBaseHeight + 100.0) {
+            this.params.cloudTopHeight = this.params.cloudBaseHeight + 100.0;
+        }
+    }
+    applyPreset(presetKey) {
+        const preset = WEATHER_PRESETS[presetKey];
+        if (!preset) {
+            throw new Error(`Unknown weather preset: ${presetKey}`);
+        }
+        this.setParams(preset.params);
+    }
     update(scene, time) {
         this.elapsedTime += 0.016;
+
+        scene.globe.depthTestAgainstTerrain = true;
+
         this.rainStage.enabled = Boolean(this.params.rainEnabled);
         this.snowStage.enabled = Boolean(this.params.snowEnabled);
-        this.cloudShadowStage.enabled = (this.params.cloudShadowStrength || 0) > 0.001;
         if (this.params.rainAudioEnabled && this.params.rainEnabled) {
-            if (!this.rainAudioIsPlaying) { this.rainAudioPool[0].play().catch(() => {}); this.rainAudioIsPlaying = true; }
+            if (!this.rainAudioIsPlaying) { this.rainAudioPool[0].play().catch(() => { }); this.rainAudioIsPlaying = true; }
             this.rainAudioPool[0].volume = this.params.rainAudioVolume;
         } else {
             this.rainAudioPool.forEach(a => { a.volume = 0; a.pause(); });
@@ -612,9 +648,92 @@ export class CesiumWeatherSystem {
     }
     triggerLightning() {
         const t = this.thunderAudioPool.find(a => a.paused || a.ended);
-        if (t && this.params.rainAudioEnabled) { t.volume = this.params.thunderVolume || 0.8; t.currentTime = 0; t.play().catch(() => {}); }
+        if (t && this.params.rainAudioEnabled) { t.volume = this.params.thunderVolume || 0.8; t.currentTime = 0; t.play().catch(() => { }); }
         const intensity = this.viewer.scene.light.intensity;
         this.viewer.scene.light.intensity = this.params.lightningIntensity * 5.0 || 5.0;
         setTimeout(() => { if (this.viewer && this.viewer.scene) this.viewer.scene.light.intensity = intensity; }, 150);
+    }
+    destroy() {
+        if (!this.viewer) {
+            return;
+        }
+
+        const scene = this.viewer.scene;
+        if (this._onPreUpdate) {
+            scene.preUpdate.removeEventListener(this._onPreUpdate);
+        }
+
+        [this.cloudStage, this.cloudShadowStage, this.fogStage, this.rainStage, this.snowStage].forEach((stage) => {
+            if (stage) {
+                scene.postProcessStages.remove(stage);
+            }
+        });
+
+        this.rainAudioPool.forEach((audio) => {
+            audio.pause();
+            audio.currentTime = 0;
+        });
+        this.thunderAudioPool.forEach((audio) => {
+            audio.pause();
+            audio.currentTime = 0;
+        });
+
+        this.rainAudioPool = [];
+        this.thunderAudioPool = [];
+        this.rainAudioIsPlaying = false;
+        this.viewer = null;
+    }
+}
+
+export class CesiumWeatherPlugin {
+    constructor(options = {}) {
+        this.params = { ...DEFAULT_SCENE_PARAMS, ...(options.params || {}) };
+        if (this.params.cloudTopHeight <= this.params.cloudBaseHeight + 100.0) {
+            this.params.cloudTopHeight = this.params.cloudBaseHeight + 100.0;
+        }
+        this.viewer = null;
+        this.system = null;
+    }
+
+    install(viewer) {
+        if (!viewer) {
+            throw new Error('CesiumWeatherPlugin.install requires a Cesium viewer.');
+        }
+
+        if (this.system) {
+            this.destroy();
+        }
+
+        this.viewer = viewer;
+        this.system = new CesiumWeatherSystem(viewer, this.params);
+        return this;
+    }
+
+    setParams(nextParams = {}) {
+        Object.assign(this.params, nextParams);
+        if (this.params.cloudTopHeight <= this.params.cloudBaseHeight + 100.0) {
+            this.params.cloudTopHeight = this.params.cloudBaseHeight + 100.0;
+        }
+        this.system?.setParams(this.params);
+        return this;
+    }
+
+    applyPreset(presetKey) {
+        const preset = WEATHER_PRESETS[presetKey];
+        if (!preset) {
+            throw new Error(`Unknown weather preset: ${presetKey}`);
+        }
+        return this.setParams(preset.params);
+    }
+
+    triggerLightning() {
+        this.system?.triggerLightning();
+        return this;
+    }
+
+    destroy() {
+        this.system?.destroy();
+        this.system = null;
+        this.viewer = null;
     }
 }
