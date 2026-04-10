@@ -4,7 +4,10 @@ import {
     ArcGisMapServerImageryProvider,
     Cartesian3,
     Color,
+    ColorBlendMode,
     createWorldTerrainAsync,
+    CustomShader,
+    CustomShaderTranslucencyMode,
     DirectionalLight,
     EllipsoidTerrainProvider,
     HeadingPitchRoll,
@@ -16,9 +19,11 @@ import {
     CesiumTerrainProvider,
     Terrain,
     Ion,
+    UniformType,
     defined as CesiumDefined,
     ScreenSpaceEventHandler,
-    ScreenSpaceEventType
+    ScreenSpaceEventType,
+    Model
 
 } from 'cesium';
 import { DEFAULT_SCENE_PARAMS, WEATHER_PRESETS } from './weatherPresets.js';
@@ -32,17 +37,30 @@ class CesiumWeatherApp {
         this.gui = null;
         this.weatherPlugin = null;
         this.localWater = null;
+        this.reflectionModels = [];
         this.params = { ...DEFAULT_SCENE_PARAMS };
 
         // Local Water params
         this.waterParams = {
-            enabled: true,
-            waveAmplitude: 4.8,
-            waveLength: 95.0,
-            waveSpeed: 0.9,
-            waterColor1: '#0a3042',
-            waterColor2: '#4d87a6',
-            foamThreshold: 0.95
+            enabled: true, // 是否开启局部海面
+            surfaceHeight: 20.0,
+            waveAmplitude: 9.3, // 浪高
+            waveLength: 155.0, // 波长
+            waveSpeed: 0.9, // 流速
+            waterColor1: '#000000', // 深水颜色
+            waterColor2: '#4d87a6', // 浅水/高光颜色
+            fresnelBias: 0.11,  // 菲涅尔偏置
+            fresnelScale: 0.76, // 菲涅尔缩放
+            fresnelPower: 4.8, // 菲涅尔指数
+            reflectionStrength: 1.18, // 反射强度
+            normalMapRepeat: 3.25, // 法线重复
+            normalMapStrength: 1.68, // 法线强度
+            normalMapSpeed: 0.22,  // 法线流速
+            normalMapBlend: 1, // 法线混合
+            shallowColor: '#63b7c8', // 浅滩颜色
+            shallowDepth: 0.0, // 浅水深度
+            shallowFade: 6.0, // 浅水过渡
+            shallowAlpha: 0.48 // 浅滩透明
         };
     }
 
@@ -83,18 +101,21 @@ class CesiumWeatherApp {
         this.weatherPlugin = new CesiumWeatherPlugin({ params: this.params });
         this.weatherPlugin.install(this.viewer);
         handleMouseEvents(this.viewer)
-
         await this.setupBaseLayer();
         this.setupCamera();
         this.setupLocalWater();
+        await addWindTurbine(this.viewer, {
+            waterHeight: this.waterParams.surfaceHeight,
+            reflectionModels: this.reflectionModels
+        });
         this.applyParams(this.params);
     }
 
     async createTerrainProvider() {
         try {
             return await createWorldTerrainAsync({
-                requestVertexNormals: true,
-                requestWaterMask: true,
+                // requestVertexNormals: true,
+                // requestWaterMask: true,
             });
         } catch (error) {
             console.warn('WorldTerrain load failed, falling back to ellipsoid terrain.', error);
@@ -131,7 +152,7 @@ class CesiumWeatherApp {
     setupLocalWater() {
         // 创建局部海面 (设置在初始相机视角的正下方附近)
         // const bounds = [121.45, 31.21, 121.49, 31.25];
-        const bounds = [119.33649918542253, 25.264754845185497, 119.40100354369514, 25.326187439777247]
+        const bounds = [119.18113701279704, 25.10883264778591, 119.4475534974461, 25.473835616200297]
         this.localWater = new LocalWaterEffect(this.viewer, {
             bounds: bounds,
             ...this.waterParams
@@ -201,12 +222,27 @@ class CesiumWeatherApp {
                 }
                 this.localWater.setParams(this.waterParams);
             }
+            this.reflectionModels.forEach((model) => {
+                model.show = this.waterParams.enabled;
+            });
         };
         waterFolder.add(this.waterParams, 'enabled').name('启用').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'surfaceHeight', 0, 60, 0.1).name('水面高度').onChange(updateWater);
         waterFolder.add(this.waterParams, 'waveAmplitude', 0, 20, 0.1).name('浪高 (Amplitude)').onChange(updateWater);
         waterFolder.add(this.waterParams, 'waveLength', 10, 500, 1).name('波长 (Length)').onChange(updateWater);
         waterFolder.add(this.waterParams, 'waveSpeed', 0, 5, 0.01).name('流速 (Speed)').onChange(updateWater);
-        waterFolder.add(this.waterParams, 'foamThreshold', -5, 10, 0.1).name('泡沫阈值）。').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'fresnelBias', 0, 0.2, 0.005).name('F0 偏置').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'fresnelScale', 0, 1.5, 0.01).name('菲涅尔缩放').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'fresnelPower', 1, 8, 0.1).name('菲涅尔指数').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'reflectionStrength', 0, 1.5, 0.01).name('反射强度').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'normalMapRepeat', 0.2, 4.0, 0.01).name('法线重复').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'normalMapStrength', 0, 2.0, 0.01).name('法线强度').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'normalMapSpeed', 0, 3.0, 0.01).name('法线流速').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'normalMapBlend', 0, 1, 0.01).name('法线混合').onChange(updateWater);
+        waterFolder.addColor(this.waterParams, 'shallowColor').name('浅滩颜色').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'shallowDepth', 0, 12, 0.1).name('浅水深度').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'shallowFade', 0.5, 20, 0.1).name('浅水过渡').onChange(updateWater);
+        waterFolder.add(this.waterParams, 'shallowAlpha', 0.1, 1, 0.01).name('浅滩透明').onChange(updateWater);
         waterFolder.addColor(this.waterParams, 'waterColor1').name('深水颜色').onChange(updateWater);
         waterFolder.addColor(this.waterParams, 'waterColor2').name('浅水/高光颜色').onChange(updateWater);
 
@@ -320,8 +356,82 @@ function handleMouseEvents(viewer) {
             const cartographic = viewer.scene.globe.ellipsoid.cartesianToCartographic(cartesian);
             const longitude = CesiumMath.toDegrees(cartographic.longitude);
             const latitude = CesiumMath.toDegrees(cartographic.latitude);
+            const height = cartographic.height;
             console.log('Longitude:', longitude);
             console.log('Latitude:', latitude);
+            console.log('Height:', height);
         }
     }, ScreenSpaceEventType.LEFT_CLICK);
+}
+
+
+// 添加风机模型
+function addWindTurbine(viewer) {
+
+    const arr = [
+        119.26084255731591,
+        25.345939038124868,
+        18.27451025684805,
+
+        119.26888646370725,
+        25.341481836101515,
+        23.358204001316007,
+
+        119.27620717442116,
+        25.33703533003674,
+        18.7269872258613,
+
+        119.28601154133774,
+        25.33086014788838,
+        19.381392519497016,
+
+        119.24999609416892,
+        25.338887543736952,
+        19.647026125876042,
+
+        119.25859162211253,
+        25.333088739779257,
+        20.08850590327226,
+
+        119.2650087755827,
+        25.32901646219196,
+        20.906778757414763,
+
+        119.26995232032239,
+        25.326086908832686,
+        18.746006481109685,
+
+        119.27663938558962,
+        25.321855109420287,
+        24.281750851989564,
+
+        119.28249339229544,
+        25.315599258743568,
+        20.02050060199963,
+    ]
+
+
+    for (let i = 0; i < arr.length; i += 3) {
+        const longitude = arr[i];
+        const latitude = arr[i + 1];
+        const height = arr[i + 2];
+        const position = Cartesian3.fromDegrees(longitude, latitude, height);
+        const modelMatrix = Matrix4.multiplyByTranslation(
+            Transforms.eastNorthUpToFixedFrame(position),
+            new Cartesian3(0.0, 0.0, 10.0),
+            new Matrix4()
+        );
+        Model.fromGltfAsync({
+            url: '/models/offshore-wind-turbine.glb',
+            modelMatrix: modelMatrix,
+            scale: 10.0,
+            minimumPixelSize: 100,
+            maximumScale: 200,
+            id: 'wind_turbine'
+        }).then((model) => {
+            viewer.scene.primitives.add(model);
+        }).catch((error) => {
+            console.error('Failed to load wind turbine model:', error);
+        });
+    }
 }
