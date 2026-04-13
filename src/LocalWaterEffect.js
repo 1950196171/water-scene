@@ -25,6 +25,23 @@ function estimateSurfaceSize(bounds) {
     return { width, height };
 }
 
+function createFallbackReflectionCanvas() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 2;
+    canvas.height = 2;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return canvas;
+}
+
+function getAliveReflectionTexture(texture) {
+    if (!texture) {
+        return null;
+    }
+
+    return texture.isDestroyed?.() ? null : texture;
+}
+
 function createWaterVertexShader(params, surfaceSize) {
     return `
 in vec3 position3DHigh;
@@ -117,6 +134,8 @@ uniform float u_fresnelBias;
 uniform float u_fresnelScale;
 uniform float u_fresnelPower;
 uniform float u_reflectionStrength;
+uniform sampler2D u_reflectionMap;
+uniform float u_hasReflectionMap;
 uniform sampler2D u_normalMap;
 uniform float u_normalMapRepeat;
 uniform float u_normalMapStrength;
@@ -221,6 +240,14 @@ czm_material czm_getMaterial(czm_materialInput materialInput) {
     float sunReflection = pow(max(dot(reflectedDir, lightDir), 0.0), mix(180.0, 520.0, fresnel));
     vec3 reflectionColor = reflectionSky * (0.6 + horizonMix * 0.4)
         + vec3(1.0, 0.96, 0.9) * sunReflection * (0.55 + horizonMix * 0.45);
+    vec2 reflectionUv = gl_FragCoord.xy / czm_viewport.zw;
+    reflectionUv.x = 1.0 - reflectionUv.x;
+    reflectionUv += combinedDetailNormal.xz * (0.012 + fresnel * 0.02) * u_normalMapStrength;
+    reflectionUv = clamp(reflectionUv, vec2(0.001), vec2(0.999));
+    vec4 planarSample = texture(u_reflectionMap, reflectionUv);
+    vec3 planarReflection = planarSample.rgb;
+    float planarMask = clamp(u_hasReflectionMap * planarSample.a, 0.0, 1.0);
+    reflectionColor = mix(reflectionColor, planarReflection, planarMask * 0.92);
     vec3 finalColor = mix(deepColor, horizonColor, 0.55 + fresnel * 0.45);
     finalColor = mix(finalColor, reflectionColor, fresnel * u_reflectionStrength);
     finalColor = mix(finalColor, u_shallowColor.rgb, shallowMix * (0.72 - fresnel * 0.18));
@@ -275,11 +302,14 @@ export class LocalWaterEffect {
             shallowColor: options.shallowColor || '#63b7c8',
             shallowDepth: options.shallowDepth ?? 2.0,
             shallowFade: options.shallowFade ?? 8.0,
-            shallowAlpha: options.shallowAlpha ?? 0.58
+            shallowAlpha: options.shallowAlpha ?? 0.58,
+            reflectionMapUrl: options.reflectionMapUrl || options.normalMapUrl || '/textures/waternormals.jpg'
         };
 
         this.timeOffset = 0;
         this.surfaceSize = estimateSurfaceSize(this.bounds);
+        this.fallbackReflectionCanvas = createFallbackReflectionCanvas();
+        this.reflectionTexture = null;
         this.init();
     }
 
@@ -318,6 +348,8 @@ export class LocalWaterEffect {
                     u_fresnelScale: this.params.fresnelScale,
                     u_fresnelPower: this.params.fresnelPower,
                     u_reflectionStrength: this.params.reflectionStrength,
+                    u_reflectionMap: this.reflectionTexture || this.fallbackReflectionCanvas,
+                    u_hasReflectionMap: this.reflectionTexture ? 1.0 : 0.0,
                     u_normalMap: this.params.normalMapUrl,
                     u_normalMapRepeat: this.params.normalMapRepeat,
                     u_normalMapStrength: this.params.normalMapStrength,
@@ -351,6 +383,7 @@ export class LocalWaterEffect {
     update(scene, time) {
         if (!this.primitive || !this.primitive.appearance) return;
 
+        this.reflectionTexture = getAliveReflectionTexture(this.reflectionTexture);
         const uniforms = this.primitive.appearance.material.uniforms;
         uniforms.u_waterColor1 = Color.fromCssColorString(this.params.waterColor1);
         uniforms.u_waterColor2 = Color.fromCssColorString(this.params.waterColor2);
@@ -358,6 +391,8 @@ export class LocalWaterEffect {
         uniforms.u_fresnelScale = this.params.fresnelScale;
         uniforms.u_fresnelPower = this.params.fresnelPower;
         uniforms.u_reflectionStrength = this.params.reflectionStrength;
+        uniforms.u_reflectionMap = this.reflectionTexture || this.fallbackReflectionCanvas;
+        uniforms.u_hasReflectionMap = this.reflectionTexture ? 1.0 : 0.0;
         uniforms.u_normalMap = this.params.normalMapUrl;
         uniforms.u_normalMapRepeat = this.params.normalMapRepeat;
         uniforms.u_normalMapStrength = this.params.normalMapStrength;
@@ -378,6 +413,18 @@ export class LocalWaterEffect {
             this.destroyPrimitive();
             this.createPrimitive();
         }
+    }
+
+    setReflectionTexture(texture) {
+        this.reflectionTexture = getAliveReflectionTexture(texture);
+
+        if (!this.primitive || !this.primitive.appearance) {
+            return;
+        }
+
+        const uniforms = this.primitive.appearance.material.uniforms;
+        uniforms.u_reflectionMap = this.reflectionTexture || this.fallbackReflectionCanvas;
+        uniforms.u_hasReflectionMap = this.reflectionTexture ? 1.0 : 0.0;
     }
 
     destroyPrimitive() {

@@ -6,10 +6,18 @@ async function bootstrap() {
         await startCesium();
         return;
     }
+
     const { startThree } = await import('./three-main.js');
     await startThree();
 }
 
 bootstrap().catch((error) => {
-    console.error('应用启动失败:', error);
+    console.error('Application startup failed:', error);
 });
+
+if (import.meta.hot) {
+    import.meta.hot.dispose(() => {
+        window.__CESIUM_APP__?.destroy?.();
+        window.__CESIUM_APP__ = null;
+    });
+}
